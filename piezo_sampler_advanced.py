@@ -5,191 +5,225 @@ import numpy as np
 from collections import deque
 from datetime import datetime
 
+# =========================
 # Configuration
-SAMPLE_RATE_HZ = 10  # How many times per second to process and print values
-CHANNEL = 1  # AD3 channel where piezo is connected
-VOLTAGE_RANGE = 5  # ±5V range (adjust based on your piezo output)
-THRESHOLD = 0.5  # Voltage threshold for collision detection
-AVERAGING_WINDOW = 10  # Number of samples to average
-LOG_TO_FILE = False  # Set to True to log data to CSV file
+# =========================
+PRINT_HZ = 10                 # UI/print frequency (times per second)
+CHANNEL = 1                   # AD3 channel
+# Choose a safe default: if using MTE inputs start small (±2.5 V typical). With BNC+probe, larger is fine.
+VOLTAGE_RANGE = 5             # Full-scale ±V (adjust to your hardware path)
+SCOPE_FS = 100_000            # ADC sampling frequency [samples/second]
+CHUNK_MS = 100                # Chunk length to process [ms]; 100 ms -> 10 chunks/s @ PRINT_HZ = 10
+THRESHOLD_HI = 0.5            # Fixed high threshold [V]; set to None to auto-calibrate
+HYSTERESIS_RATIO = 0.6        # TH_LO = HYSTERESIS_RATIO * THRESHOLD_HI
+HOLDOFF_MS = 120              # Refractory period after an event [ms]
+LOG_TO_FILE = False           # Event-level log
+SAVE_EVENT_WAVEFORMS = False  # Save raw event waveforms (.npy)
 
-class PiezoSampler:
+# =========================
+# Utility
+# =========================
+def now_ts():
+    return time.strftime("%H:%M:%S", time.localtime())
+
+class PiezoMonitor:
     def __init__(self):
-        self.device_data = None
-        self.voltage_history = deque(maxlen=AVERAGING_WINDOW)
-        self.peak_voltage = 0
-        self.collision_count = 0
-        self.log_file = None
-        
-        if LOG_TO_FILE:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"piezo_log_{timestamp}.csv"
-            self.log_file = open(filename, 'w')
-            self.log_file.write("Timestamp,Voltage,Average,Peak,Collision\n")
-            print(f"Logging to: {filename}")
-    
+        self.dev = None
+        self.th_hi = THRESHOLD_HI
+        self.th_lo = (HYSTERESIS_RATIO * THRESHOLD_HI) if THRESHOLD_HI is not None else None
+        self.event_active = False
+        self.last_event_end_t = -1e9
+        self.hits = 0
+        self.peak_voltage = 0.0
+        self.chunk_samples = max(1, int(SCOPE_FS * (CHUNK_MS / 1000.0)))
+        self.print_period = 1.0 / PRINT_HZ
+        self.holdoff_s = HOLDOFF_MS / 1000.0
+        self.log = None
+
     def connect(self):
-        """Connect to the Analog Discovery 3"""
-        print("Connecting to Analog Discovery 3...")
-        self.device_data = device.open()
-        
-        # Initialize scope with optimal settings for piezo sensing
-        scope.open(self.device_data,
-                   sampling_frequency=100e03,  # 100 kHz for good time resolution
-                   buffer_size=100,
-                   offset=0,
-                   amplitude_range=VOLTAGE_RANGE)
-        
-        print(f"Connected! Sampling on channel {CHANNEL}")
-        print(f"Sample rate: {SAMPLE_RATE_HZ} Hz")
-        print(f"Collision threshold: {THRESHOLD} V")
-        print(f"Averaging window: {AVERAGING_WINDOW} samples")
-        print("Press Ctrl+C to stop\n")
-        print("-" * 60)
-    
-    def sample_continuous(self):
-        """Continuously sample and display piezo signal"""
-        sample_period = 1.0 / SAMPLE_RATE_HZ
-        
+        print("Connecting to Analog Discovery 3 ...")
+        self.dev = device.open()
+
+        scope.open(
+            self.dev,
+            sampling_frequency=SCOPE_FS,
+            buffer_size=self.chunk_samples,
+            offset=0,
+            amplitude_range=VOLTAGE_RANGE,
+        )
+
+        if LOG_TO_FILE:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            self.log = open(f"piezo_events_{ts}.csv", "w", buffering=1)
+            self.log.write("timestamp,peak_v,ptp_v,rms_v,energy_v2,chunk_ms,event\n")
+            print(f"Logging events to piezo_events_{ts}.csv")
+
+        print(f"Connected on CH{CHANNEL}")
+        print(f"ADC rate: {SCOPE_FS/1000:.1f} kS/s | chunk: {CHUNK_MS} ms ({self.chunk_samples} samples)")
+        if self.th_hi is not None:
+            print(f"Fixed thresholds: TH_HI={self.th_hi:.3f} V, TH_LO={self.th_hi*HYSTERESIS_RATIO:.3f} V")
+        else:
+            print("Auto threshold: will calibrate on idle noise")
+        print("Press Ctrl+C to stop\n" + "-"*60)
+
+    def _auto_calibrate_threshold(self, seconds=2.0, k_sigma=10.0):
+        """
+        Collect 'seconds' of idle data, estimate noise sigma via MAD, set TH_HI = k_sigma*sigma.
+        """
+        print(f"Calibrating threshold for {seconds:.1f}s ... please avoid impacts.")
+        need = int(SCOPE_FS * seconds)
+        buf = np.empty(0, dtype=np.float32)
+        while buf.size < need:
+            chunk = np.array(scope.record(self.dev, CHANNEL), dtype=np.float32)
+            # Remove DC per chunk (robust)
+            chunk = chunk - np.median(chunk)
+            buf = np.concatenate((buf, chunk))
+        # MAD-based sigma estimate (Gaussian: sigma ≈ MAD/0.6745)
+        mad = np.median(np.abs(buf - np.median(buf)))
+        sigma = mad / 0.6745 if mad > 0 else np.std(buf)
+        self.th_hi = float(k_sigma * sigma)
+        self.th_lo = float(HYSTERESIS_RATIO * self.th_hi)
+        print(f"Auto thresholds: TH_HI={self.th_hi:.3f} V, TH_LO={self.th_lo:.3f} V\n" + "-"*60)
+
+    def _process_chunk(self, x):
+        """
+        Return per-chunk features and event state transitions.
+        """
+        x = x.astype(np.float32, copy=False)
+        # Remove slow offset if DC-coupled; safe even if AC-coupled
+        x = x - np.median(x)
+
+        peak = float(np.max(np.abs(x)))
+        p2p = float(np.max(x) - np.min(x))
+        rms = float(np.sqrt(np.mean(x*x)))
+        energy = float(np.sum(x*x))  # not normalized by length -> "energy proxy"
+
+        # Update global peak
+        if peak > self.peak_voltage:
+            self.peak_voltage = peak
+
+        t_now = time.monotonic()
+        event_started, event_ended = False, False
+
+        # Event logic with Schmitt trigger and holdoff
+        if not self.event_active:
+            if self.th_hi is not None and (peak >= self.th_hi):
+                if (t_now - self.last_event_end_t) >= self.holdoff_s:
+                    self.event_active = True
+                    self.hits += 1
+                    event_started = True
+        else:
+            # End event when the whole chunk is below TH_LO (aggressive) or the peak drops below TH_LO (lenient)
+            if self.th_lo is None:
+                lo_cond = peak < (0.6 * self.th_hi)  # fallback
+            else:
+                lo_cond = peak < self.th_lo
+            if lo_cond:
+                self.event_active = False
+                self.last_event_end_t = t_now
+                event_ended = True
+
+        return peak, p2p, rms, energy, event_started, event_ended, x
+
+    def run(self):
+        if self.th_hi is None:
+            self._auto_calibrate_threshold()
+
         try:
             while True:
-                start_time = time.time()
-                
-                # Get voltage reading
-                voltage = scope.measure(self.device_data, CHANNEL)
-                self.voltage_history.append(voltage)
-                
-                # Calculate statistics
-                if len(self.voltage_history) > 0:
-                    avg_voltage = np.mean(self.voltage_history)
-                    std_voltage = np.std(self.voltage_history) if len(self.voltage_history) > 1 else 0
-                else:
-                    avg_voltage = voltage
-                    std_voltage = 0
-                
-                # Update peak
-                abs_voltage = abs(voltage)
-                if abs_voltage > self.peak_voltage:
-                    self.peak_voltage = abs_voltage
-                
-                # Check for collision
-                collision_detected = abs_voltage > THRESHOLD
-                if collision_detected:
-                    self.collision_count += 1
-                
-                # Display data
-                timestamp = time.strftime("%H:%M:%S", time.localtime())
-                print(f"[{timestamp}] ", end="")
-                print(f"V: {voltage:+.4f}V | ", end="")
-                print(f"Avg: {avg_voltage:+.4f}V | ", end="")
-                print(f"Std: {std_voltage:.4f}V | ", end="")
-                print(f"Peak: {self.peak_voltage:.4f}V | ", end="")
-                print(f"Hits: {self.collision_count}", end="")
-                
-                if collision_detected:
-                    print(" *** COLLISION! ***", end="")
-                
-                print()  # New line
-                
-                # Log to file if enabled
-                if self.log_file:
-                    self.log_file.write(f"{timestamp},{voltage:.6f},{avg_voltage:.6f},"
-                                       f"{self.peak_voltage:.6f},{1 if collision_detected else 0}\n")
-                    self.log_file.flush()
-                
-                # Maintain sample rate
-                elapsed = time.time() - start_time
-                if elapsed < sample_period:
-                    time.sleep(sample_period - elapsed)
-                    
+                t0 = time.monotonic()
+                raw = np.array(scope.record(self.dev, CHANNEL), dtype=np.float32)
+                peak, p2p, rms, energy, ev_start, ev_end, detrended = self._process_chunk(raw)
+
+                # Print status line
+                stamp = now_ts()
+                line = (f"[{stamp}] "
+                        f"peak:{peak:6.3f}V  p2p:{p2p:6.3f}V  rms:{rms:6.3f}V  "
+                        f"E:{energy:9.1f}  max:{self.peak_voltage:6.3f}V  hits:{self.hits}")
+                if ev_start:
+                    line += "  *** COLLISION ***"
+                print(line)
+
+                # Event-level logging
+                if self.log:
+                    self.log.write(f"{stamp},{peak:.6f},{p2p:.6f},{rms:.6f},{energy:.3f},{CHUNK_MS},{1 if ev_start else 0}\n")
+
+                # Save waveform if an event starts in this chunk
+                if SAVE_EVENT_WAVEFORMS and ev_start:
+                    ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                    np.save(f"impact_{ts}.npy", detrended)  # centered waveform
+
+                # Pace the loop for human-readable console output
+                elapsed = time.monotonic() - t0
+                if elapsed < self.print_period:
+                    time.sleep(self.print_period - elapsed)
+
         except KeyboardInterrupt:
-            print("\n" + "-" * 60)
-            print("Measurement stopped")
-            print(f"Total collisions detected: {self.collision_count}")
-            print(f"Maximum voltage recorded: {self.peak_voltage:.4f}V")
-    
-    def sample_buffered(self, duration_seconds=1):
-        """Record a buffer of data for specified duration"""
-        print(f"\nRecording {duration_seconds} second(s) of data...")
-        
-        # Configure for buffered recording
-        buffer_size = int(100e03 * duration_seconds)  # Based on 100kHz sampling
-        if buffer_size > self.device_data.analog.input.max_buffer_size:
-            buffer_size = self.device_data.analog.input.max_buffer_size
-            actual_duration = buffer_size / 100e03
-            print(f"Adjusted duration to {actual_duration:.2f}s due to buffer limits")
-        
-        scope.open(self.device_data,
-                   sampling_frequency=100e03,
-                   buffer_size=buffer_size,
-                   offset=0,
-                   amplitude_range=VOLTAGE_RANGE)
-        
-        # Record data
-        buffer = scope.record(self.device_data, CHANNEL)
-        
-        # Analyze buffer
-        buffer_np = np.array(buffer)
-        max_val = np.max(np.abs(buffer_np))
-        mean_val = np.mean(buffer_np)
-        std_val = np.std(buffer_np)
-        
-        # Find peaks (simple threshold crossing)
-        peaks = np.where(np.abs(buffer_np) > THRESHOLD)[0]
-        num_peaks = len(peaks)
-        
-        print(f"Buffer analysis:")
-        print(f"  Samples: {len(buffer)}")
-        print(f"  Max amplitude: {max_val:.4f}V")
-        print(f"  Mean: {mean_val:.4f}V")
-        print(f"  Std deviation: {std_val:.4f}V")
-        print(f"  Threshold crossings: {num_peaks}")
-        
-        return buffer
-    
+            print("\n" + "-"*60)
+            print("Stopped by user.")
+            print(f"Total hits: {self.hits}")
+            print(f"Max observed voltage: {self.peak_voltage:.3f} V")
+
+    def record_buffer(self, duration_seconds=1.0):
+        """
+        Capture a single long buffer (best effort within device buffer limits) and summarize it.
+        """
+        print(f"\nRecording {duration_seconds:.2f} s of data ...")
+        buffer_size = int(SCOPE_FS * duration_seconds)
+        # If your SDK exposes a max buffer size property, check here; otherwise just ask for it.
+        scope.open(self.dev, sampling_frequency=SCOPE_FS, buffer_size=buffer_size,
+                   offset=0, amplitude_range=VOLTAGE_RANGE)
+        data = np.array(scope.record(self.dev, CHANNEL), dtype=np.float32)
+        data = data - np.median(data)
+        peak = float(np.max(np.abs(data)))
+        p2p = float(np.max(data) - np.min(data))
+        rms = float(np.sqrt(np.mean(data*data)))
+        crossings = int(np.count_nonzero(np.abs(data) > (self.th_hi if self.th_hi else 0.5)))
+        print("Buffer analysis:")
+        print(f"  Samples: {len(data)}  | duration: {len(data)/SCOPE_FS:.3f}s")
+        print(f"  Max amplitude: {peak:.4f} V  | p-p: {p2p:.4f} V  | RMS: {rms:.4f} V")
+        print(f"  Threshold crossings: {crossings}")
+        return data
+
     def cleanup(self):
-        """Clean up resources"""
-        if self.log_file:
-            self.log_file.close()
-        if self.device_data:
-            scope.close(self.device_data)
-            device.close(self.device_data)
-            print("Device disconnected")
+        if self.log:
+            self.log.close()
+        if self.dev:
+            try:
+                scope.close(self.dev)
+            finally:
+                device.close(self.dev)
+            print("Device disconnected.")
 
 def main():
-    sampler = PiezoSampler()
-    
+    mon = PiezoMonitor()
     try:
-        sampler.connect()
-        
-        # Choose sampling mode
+        mon.connect()
+
         print("\nSelect mode:")
-        print("1. Continuous sampling (real-time display)")
-        print("2. Buffered recording (record then analyze)")
-        print("3. Both (record buffer first, then continuous)")
-        
+        print("1. Continuous monitoring (chunked streaming)")
+        print("2. One-shot buffered capture (then analyze)")
+        print("3. Buffered capture, then monitor")
         choice = input("Enter choice (1-3): ").strip()
-        
-        if choice == '2' or choice == '3':
-            duration = float(input("Enter recording duration in seconds: "))
-            buffer = sampler.sample_buffered(duration)
-            
-            # Optional: save buffer to file
+
+        if choice in ("2", "3"):
+            dur = float(input("Enter recording duration in seconds: "))
+            buf = mon.record_buffer(dur)
             save = input("Save buffer to file? (y/n): ").strip().lower()
-            if save == 'y':
-                filename = f"piezo_buffer_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
-                np.savetxt(filename, buffer, fmt='%.6f')
-                print(f"Buffer saved to {filename}")
-        
-        if choice == '1' or choice == '3':
-            print("\nStarting continuous sampling...")
-            time.sleep(1)
-            sampler.sample_continuous()
-            
+            if save == "y":
+                fname = f"buffer_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+                np.savetxt(fname, buf, fmt="%.6f")
+                print(f"Saved {fname}")
+
+        if choice in ("1", "3"):
+            print("\nStarting continuous monitoring ...")
+            time.sleep(0.5)
+            mon.run()
+
     except Exception as e:
         print(f"Error: {e}")
     finally:
-        sampler.cleanup()
+        mon.cleanup()
 
 if __name__ == "__main__":
     main()
