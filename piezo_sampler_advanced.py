@@ -173,6 +173,8 @@ class PiezoMonitor:
         # If your SDK exposes a max buffer size property, check here; otherwise just ask for it.
         scope.open(self.dev, sampling_frequency=SCOPE_FS, buffer_size=buffer_size,
                    offset=0, amplitude_range=VOLTAGE_RANGE)
+        # Wait for the buffer to fill (add extra time for overhead)
+        time.sleep(duration_seconds + 0.1)
         data = np.array(scope.record(self.dev, CHANNEL), dtype=np.float32)
         data = data - np.median(data)
         peak = float(np.max(np.abs(data)))
