@@ -9,11 +9,11 @@ from WF_SDK import device, scope
 SAMPLE_RATE_HZ = 10  # How many times per second to print values
 CHANNEL = 1  # AD3 channel where piezo is connected
 VOLTAGE_RANGE = 5  # ±5V range (adjust based on your piezo output)
-THRESHOLD = 0.1  # Voltage threshold for collision detection (adjust as needed)
-DISTANCE = 0.8  # Distance traveled in meters before collision'
+THRESHOLD = 0.025  # Voltage threshold for collision detection (adjust as needed)
+DISTANCE = 0.89  # Distance traveled in meters before collision'
 
-LEFT_SPEED = 1000  # Speed for left motors
-RIGHT_SPEED = 1000  # Speed for right motors
+LEFT_SPEED = 57  # Speed for left motors
+RIGHT_SPEED = 50  # Speed for right motors
 
 # Sampling frequency
 SAMPLING_FREQUENCY = 100e3  # 100 kHz from scope
@@ -173,10 +173,10 @@ def end_routine():
 
         # Find next available filename in data subdirectory
         counter = 0
-        while os.path.exists(os.path.join(data_dir, f'rover_run_data_{counter}.csv')):
+        while os.path.exists(os.path.join(data_dir, f'rover_run_data_{counter}_L{LEFT_SPEED}_R{RIGHT_SPEED}.csv')):
             counter += 1
 
-        csv_filename = os.path.join(data_dir, f'rover_run_data_{counter}.csv')
+        csv_filename = os.path.join(data_dir, f'rover_run_data_{counter}_L{LEFT_SPEED}_R{RIGHT_SPEED}.csv')
         with open(csv_filename, 'w', newline='') as csv_file:
             csv_writer = csv.writer(csv_file)
             csv_writer.writerow(['timestamp', 'voltage'])
@@ -205,7 +205,7 @@ def main():
     try:
         print("start")
         open_ad3()
-        bot.start('/dev/cu.usbserial-21330')
+        bot.start('/dev/cu.usbserial-2110')
         print("connected")
         time.sleep(1)
 
@@ -232,11 +232,11 @@ def main():
                 # Continue sampling while collision response is running
                 while collision_thread.is_alive():
                     check_collision()
-                    time.sleep(0.001)
+                    # time.sleep(0.001)
 
                 break
 
-            time.sleep(0.001)  # Reduced from 10ms to 1ms for faster sampling
+            # time.sleep(0.001)  # Reduced from 10ms to 1ms for faster sampling
 
     finally:
         end_routine()
