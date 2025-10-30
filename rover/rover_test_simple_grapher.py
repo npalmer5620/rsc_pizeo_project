@@ -7,8 +7,8 @@ from matplotlib import rcParams
 from datetime import datetime
 
 # Configuration
-THRESHOLD = 0.1  # Voltage threshold for collision detection (must match rover_test_simple.py)
-DISTANCE = 0.8  # Distance traveled in meters (adjust based on your setup)
+THRESHOLD = 0.025  # Voltage threshold for collision detection (must match rover_test_simple.py)
+DISTANCE = 0.89  # Distance traveled in meters (adjust based on your setup)
 
 # Publication-quality matplotlib configuration
 # Settings optimized for single-column journal figures (3.25 in wide)
@@ -63,6 +63,40 @@ def find_collision_event(voltages, relative_time, threshold=THRESHOLD):
         if abs(voltage) > threshold:
             return i, relative_time[i]
     return None, None
+
+
+def calculate_peak_voltage_in_window(voltages, relative_time, collision_idx, collision_time, window_ms):
+    """Calculate peak voltage within ±window_ms of collision.
+    Returns tuple: (peak_voltage, peak_time_relative_to_collision)
+    Returns (None, None) if no collision or insufficient data in window."""
+    if collision_idx is None or collision_time is None:
+        return None, None
+
+    # Convert window from ms to seconds
+    window_s = window_ms / 1000.0
+
+    # Find indices for the window
+    start_time = collision_time - window_s
+    end_time = collision_time + window_s
+
+    mask = (relative_time >= start_time) & (relative_time <= end_time)
+
+    if not np.any(mask):
+        return None, None
+
+    # Extract windowed data
+    windowed_voltage = voltages[mask]
+    windowed_time = relative_time[mask]
+
+    # Find index of maximum absolute voltage
+    max_abs_idx = np.argmax(np.abs(windowed_voltage))
+
+    # Get peak voltage (signed value) and time relative to collision
+    peak_voltage = windowed_voltage[max_abs_idx]
+    peak_time_absolute = windowed_time[max_abs_idx]
+    peak_time_relative = (peak_time_absolute - collision_time) * 1000  # Convert to ms
+
+    return peak_voltage, peak_time_relative
 
 
 def extract_trial_name(csv_filepath):
@@ -364,12 +398,41 @@ def create_multi_detail_figure(all_trials_data, output_file, window_ms=300):
 
 def main():
     if len(sys.argv) < 2:
-        print("Usage: python rover_test_simple_grapher.py <csv_file> [csv_file2] [csv_file3] ...")
+        print("Usage: python rover_test_simple_grapher.py <csv_file> [csv_file2] [csv_file3] ... [--window-size MS]")
         print("  Single file:   python rover_test_simple_grapher.py data/rover_run_data_0.csv")
         print("  Multiple files: python rover_test_simple_grapher.py data/rover_run_data_0.csv data/rover_run_data_1.csv data/rover_run_data_2.csv")
+        print("  Custom window:  python rover_test_simple_grapher.py data/rover_run_data_0.csv --window-size 500")
         sys.exit(1)
 
-    csv_files = sys.argv[1:]
+    # Parse arguments: extract --window-size if present
+    args = sys.argv[1:]
+    window_ms = 300  # Default window size in milliseconds
+
+    csv_files = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == '--window-size':
+            if i + 1 < len(args):
+                try:
+                    window_ms = int(args[i + 1])
+                    i += 2  # Skip both --window-size and its value
+                except ValueError:
+                    print(f"Error: --window-size requires an integer value (milliseconds)")
+                    sys.exit(1)
+            else:
+                print(f"Error: --window-size requires a value")
+                sys.exit(1)
+        elif not arg.startswith('--'):
+            csv_files.append(arg)
+            i += 1
+        else:
+            print(f"Error: Unknown option {arg}")
+            sys.exit(1)
+
+    if not csv_files:
+        print("Error: No CSV files specified")
+        sys.exit(1)
 
     # Create figures directory if it doesn't exist
     figures_dir = 'figures'
@@ -392,6 +455,11 @@ def main():
             # Find collision event
             collision_idx, collision_time = find_collision_event(voltages, relative_time)
 
+            # Calculate peak voltage in window
+            peak_voltage, peak_time_rel = calculate_peak_voltage_in_window(
+                voltages, relative_time, collision_idx, collision_time, window_ms
+            )
+
             # Print collision information
             if collision_time is not None:
                 speed = DISTANCE / collision_time
@@ -400,6 +468,14 @@ def main():
                 print(f"  Distance traveled: {DISTANCE} m")
                 print(f"  Average speed: {speed:.3f} m/s")
                 print(f"  Voltage at collision: {voltages[collision_idx]:.4f} V")
+
+                # Print peak voltage in window
+                if peak_voltage is not None:
+                    print(f"\n  Peak voltage in ±{window_ms}ms window:")
+                    print(f"    Peak voltage: {peak_voltage:+.4f} V")
+                    print(f"    Time of peak: {peak_time_rel:+.1f} ms (relative to collision)")
+                else:
+                    print(f"\n  No data in ±{window_ms}ms window around collision")
             else:
                 print("No collision detected (voltage never exceeded threshold)")
 
@@ -415,7 +491,7 @@ def main():
             create_timeline_figure(relative_time, voltages, collision_idx, collision_time,
                                  timeline_output)
             create_event_detail_figure(relative_time, voltages, collision_idx, collision_time,
-                                      event_output, window_ms=300)
+                                      event_output, window_ms=window_ms)
 
             print(f"\nFigures saved successfully!")
 
@@ -439,6 +515,11 @@ def main():
                 # Find collision event
                 collision_idx, collision_time = find_collision_event(voltages, relative_time)
 
+                # Calculate peak voltage in window
+                peak_voltage, peak_time_rel = calculate_peak_voltage_in_window(
+                    voltages, relative_time, collision_idx, collision_time, window_ms
+                )
+
                 # Get trial name and color
                 trial_name = f"Trial {file_idx + 1}"
                 color = TRIAL_COLORS[file_idx % len(TRIAL_COLORS)]
@@ -453,6 +534,8 @@ def main():
                     'relative_time': relative_time,
                     'collision_idx': collision_idx,
                     'collision_time': collision_time,
+                    'peak_voltage': peak_voltage,
+                    'peak_time_rel': peak_time_rel,
                     'color': color
                 }
                 all_trials_data.append(trial_data)
@@ -464,15 +547,38 @@ def main():
                 else:
                     print(f"    No collision detected")
 
+            # Print peak voltage summary table
+            print(f"\n{'='*100}")
+            print(f"Peak Voltage Summary (±{window_ms}ms window around collision)")
+            print(f"{'='*100}")
+            print(f"{'Trial':<10} {'Peak Voltage':<15} {'Time of Peak (ms)':<20} {'Collision Time (s)':<20} {'Speed (m/s)':<15}")
+            print(f"{'-'*100}")
+
+            for trial_data in all_trials_data:
+                trial_name = trial_data['trial_name']
+                collision_time = trial_data['collision_time']
+                peak_voltage = trial_data['peak_voltage']
+                peak_time_rel = trial_data['peak_time_rel']
+
+                if collision_time is not None:
+                    speed = DISTANCE / collision_time
+                    peak_voltage_str = f"{peak_voltage:+.4f} V" if peak_voltage is not None else "N/A"
+                    peak_time_str = f"{peak_time_rel:+.1f}" if peak_time_rel is not None else "N/A"
+                    print(f"{trial_name:<10} {peak_voltage_str:<15} {peak_time_str:<20} {collision_time:<20.3f} {speed:<15.3f}")
+                else:
+                    print(f"{trial_name:<10} {'No collision':<15} {'N/A':<20} {'N/A':<20} {'N/A':<15}")
+
+            print(f"{'='*100}\n")
+
             # Generate timestamped output filenames
             timestamp = generate_timestamp()
             timeline_output = os.path.join(figures_dir, f"merged_{timestamp}_timeline.png")
             detail_output = os.path.join(figures_dir, f"merged_{timestamp}_detail.png")
 
             # Create multi-trial figures
-            print(f"\nGenerating multi-trial publication-quality figures...")
-            create_multi_timeline_figure(all_trials_data, timeline_output, window_ms=300)
-            create_multi_detail_figure(all_trials_data, detail_output, window_ms=300)
+            print(f"Generating multi-trial publication-quality figures...")
+            create_multi_timeline_figure(all_trials_data, timeline_output, window_ms=window_ms)
+            create_multi_detail_figure(all_trials_data, detail_output, window_ms=window_ms)
 
             print(f"\nMulti-trial figures saved successfully!")
 
