@@ -7,8 +7,8 @@ from matplotlib import rcParams
 from datetime import datetime
 
 # Configuration
-THRESHOLD = 0.025  # Voltage threshold for collision detection (must match rover_test_simple.py)
-DISTANCE = 0.89  # Distance traveled in meters (adjust based on your setup)
+THRESHOLD = 0.04  # Voltage threshold for collision detection (must match rover_test_simple.py)
+DISTANCE = 0.8  # Distance traveled in meters (adjust based on your setup)
 
 # Publication-quality matplotlib configuration
 # Settings optimized for single-column journal figures (3.25 in wide)
