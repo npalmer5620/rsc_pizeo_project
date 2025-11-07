@@ -7,7 +7,7 @@ from matplotlib import rcParams
 from datetime import datetime
 
 # Configuration
-THRESHOLD = 0.04  # Voltage threshold for collision detection (must match rover_test_simple.py)
+THRESHOLD = 0.025  # Voltage threshold for collision detection (25 mV)
 DISTANCE = 0.8  # Distance traveled in meters (adjust based on your setup)
 
 # Publication-quality matplotlib configuration
@@ -192,33 +192,34 @@ def create_event_detail_figure(relative_time, voltages, collision_idx, collision
     windowed_time = relative_time[mask]
     windowed_voltage = voltages[mask]
 
-    # Convert to relative time centered at collision (in ms)
-    windowed_time_relative = (windowed_time - collision_time) * 1000  # Convert to ms
+    # Convert to absolute time in milliseconds (since start of run)
+    windowed_time_ms = windowed_time * 1000  # Convert to ms
 
     # Create figure
     fig, ax = plt.subplots(figsize=(3.25, 2.5))
 
     # Shade pre-collision region (commented out for cleaner visualization)
-    # pre_start_ms = -100
-    # pre_end_ms = 0
+    # pre_start_ms = collision_time * 1000 - 100
+    # pre_end_ms = collision_time * 1000
     # ax.axvspan(pre_start_ms, pre_end_ms, alpha=0.15, color=COLOR_EVENT_PRE, zorder=1)
 
     # Shade post-collision region (commented out for cleaner visualization)
-    # post_start_ms = 0
-    # post_end_ms = 100
+    # post_start_ms = collision_time * 1000
+    # post_end_ms = collision_time * 1000 + 100
     # ax.axvspan(post_start_ms, post_end_ms, alpha=0.15, color=COLOR_EVENT_POST, zorder=1)
 
     # Plot voltage data
-    ax.plot(windowed_time_relative, windowed_voltage, color=COLOR_PRIMARY,
+    ax.plot(windowed_time_ms, windowed_voltage, color=COLOR_PRIMARY,
             linewidth=0.75, zorder=2)
 
     # Mark collision peak (commented out for cleaner visualization)
-    # peak_idx = np.argmin(np.abs(windowed_time_relative - 0))
-    # ax.plot(0, windowed_voltage[peak_idx], 'o', color=COLOR_PEAK,
+    # collision_time_ms = collision_time * 1000
+    # peak_idx = np.argmin(np.abs(windowed_time_ms - collision_time_ms))
+    # ax.plot(windowed_time_ms[peak_idx], windowed_voltage[peak_idx], 'o', color=COLOR_PEAK,
     #         markersize=5, zorder=5)
 
     # Styling
-    ax.set_xlabel('Time relative to collision (ms)', fontsize=8)
+    ax.set_xlabel('Time since start (ms)', fontsize=8)
     ax.set_ylabel('Voltage (V)', fontsize=8)
 
     # Grid: Y-axis only, light, minimal
@@ -245,27 +246,24 @@ def create_multi_timeline_figure(all_trials_data, output_file, window_ms=300):
     fig, ax = plt.subplots(figsize=(3.25, 2.5))
 
     # Plot each trial
-    for trial_idx, trial_data in enumerate(all_trials_data):
+    for trial_data in all_trials_data:
         relative_time = trial_data['relative_time']
         voltages = trial_data['voltages']
         collision_time = trial_data['collision_time']
         trial_name = trial_data['trial_name']
         color = trial_data['color']
 
-        # Shift time so collision is at t=0 for alignment
-        shifted_time = relative_time - collision_time
+        # Plot voltage data for this trial using absolute time since start
+        ax.plot(relative_time, voltages, color=color, linewidth=0.75, label=trial_name, alpha=0.8)
 
-        # Plot voltage data for this trial
-        ax.plot(shifted_time, voltages, color=color, linewidth=0.75, label=trial_name, alpha=0.8)
-
-        # Shade detail region for this trial (±300ms around collision)
+        # Shade detail region for this trial (±window_ms around collision)
         detail_window_s = window_ms / 1000.0
-        detail_start = -detail_window_s
-        detail_end = detail_window_s
+        detail_start = collision_time - detail_window_s
+        detail_end = collision_time + detail_window_s
         ax.axvspan(detail_start, detail_end, alpha=0.05, color=color, zorder=0)
 
     # Styling
-    ax.set_xlabel('Time relative to collision (s)', fontsize=8)
+    ax.set_xlabel('Time since start (s)', fontsize=8)
     ax.set_ylabel('Voltage (V)', fontsize=8)
 
     # Grid: Y-axis only, light, minimal
@@ -289,12 +287,19 @@ def create_multi_timeline_figure(all_trials_data, output_file, window_ms=300):
     plt.close(fig)
 
 
-def create_multi_detail_figure(all_trials_data, output_file, window_ms=300):
+def create_multi_detail_figure(all_trials_data, output_file, window_ms=500):
     """Create publication-quality detail figure with multiple trials overlaid, each centered on its collision.
-    Trials are sorted by magnitude (smallest first) for better visibility."""
+    All collisions are aligned at the first trial's collision time. Trials are sorted by magnitude (smallest first) for better visibility."""
     rcParams.update(PUBLICATION_RCPARAMS)
 
     fig, ax = plt.subplots(figsize=(3.25, 2.5))
+
+    # Find the first trial's collision time to use as x-axis reference
+    first_collision_time_s = None
+    for trial_data in all_trials_data:
+        if trial_data['collision_idx'] is not None:
+            first_collision_time_s = trial_data['collision_time']
+            break
 
     # First pass: Calculate magnitude for each trial in the collision window
     for trial_data in all_trials_data:
@@ -331,8 +336,30 @@ def create_multi_detail_figure(all_trials_data, output_file, window_ms=300):
     for idx, trial_data in enumerate(sorted_trials):
         trial_data['trial_name'] = f"Trial {idx + 1}"
 
+    # Calculate global minimum time for x-axis alignment
+    min_time_overall = float('inf')
+    for td in sorted_trials:
+        if td['collision_idx'] is None:
+            continue
+        window_s = window_ms / 1000.0
+        start = td['collision_time'] - window_s
+        end = td['collision_time'] + window_s
+        m = (td['relative_time'] >= start) & (td['relative_time'] <= end)
+        if np.any(m):
+            ct = td['collision_time']
+            if first_collision_time_s is not None:
+                offset = first_collision_time_s - ct
+                t = td['relative_time'][m] + offset
+            else:
+                t = td['relative_time'][m]
+            min_time_overall = min(min_time_overall, np.min(t))
+
+    # Draw detection threshold line
+    ax.axhline(y=THRESHOLD, color='#CC0000', linestyle='--', linewidth=0.5, alpha=0.7, zorder=3, label='Detection threshold')
+    ax.axhline(y=-THRESHOLD, color='#CC0000', linestyle='--', linewidth=0.5, alpha=0.7, zorder=3)
+
     # Plot each trial in magnitude-sorted order (smallest first = on top)
-    for trial_idx, trial_data in enumerate(sorted_trials):
+    for trial_data in sorted_trials:
         relative_time = trial_data['relative_time']
         voltages = trial_data['voltages']
         collision_idx = trial_data['collision_idx']
@@ -358,21 +385,23 @@ def create_multi_detail_figure(all_trials_data, output_file, window_ms=300):
         windowed_time = relative_time[mask]
         windowed_voltage = voltages[mask]
 
-        # Convert to relative time centered at collision (in ms)
-        windowed_time_relative = (windowed_time - collision_time) * 1000
+        # Align time data: shift so this trial's collision aligns with the first trial's collision time
+        if first_collision_time_s is not None:
+            time_offset = first_collision_time_s - collision_time
+            windowed_time_aligned = windowed_time + time_offset
+        else:
+            windowed_time_aligned = windowed_time
+
+        # Convert to milliseconds and shift to start at 0
+        windowed_time_aligned_ms = windowed_time_aligned * 1000
+        windowed_time_aligned_ms = windowed_time_aligned_ms - np.min(windowed_time_aligned_ms)
 
         # Plot this trial's data
-        ax.plot(windowed_time_relative, windowed_voltage, color=color, linewidth=0.75,
+        ax.plot(windowed_time_aligned_ms, windowed_voltage, color=color, linewidth=0.75,
                 label=trial_name, alpha=0.8)
 
-        # Mark maximum magnitude point with an X in trial color
-        max_magnitude_idx = np.argmax(np.abs(windowed_voltage))
-        max_magnitude_time = windowed_time_relative[max_magnitude_idx]
-        max_magnitude_voltage = windowed_voltage[max_magnitude_idx]
-        ax.plot(max_magnitude_time, max_magnitude_voltage, 'x', color=color, markersize=3, zorder=5)
-
     # Styling
-    ax.set_xlabel('Time relative to collision (ms)', fontsize=8)
+    ax.set_xlabel('Time (ms)', fontsize=8)
     ax.set_ylabel('Voltage (V)', fontsize=8)
 
     # Grid: Y-axis only, light, minimal
@@ -385,7 +414,7 @@ def create_multi_detail_figure(all_trials_data, output_file, window_ms=300):
 
     # Legend
     ax.legend(loc='lower left', frameon=True, fancybox=False,
-              edgecolor='gray', framealpha=0.9, fontsize=7)
+              edgecolor='gray', framealpha=0.9, fontsize=6)
 
     # Tight layout
     fig.tight_layout()
@@ -406,7 +435,7 @@ def main():
 
     # Parse arguments: extract --window-size if present
     args = sys.argv[1:]
-    window_ms = 300  # Default window size in milliseconds
+    window_ms = 500  # Default window size in milliseconds
 
     csv_files = []
     i = 0
