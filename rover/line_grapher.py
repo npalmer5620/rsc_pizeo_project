@@ -7,12 +7,15 @@ import os
 # DATA CONFIGURATION - Edit this section with your data
 # ============================================================================
 
-# Define your data as a list of (x, y) tuples
-# Example: DATA = [(0, 5), (1, 12), (2, 8), (3, 15)]
+# Collision detection threshold (from rover_test_simple_grapher.py)
+THRESHOLD = 0.025  # Voltage threshold for collision detection (50 mV)
+
+# Define your data as a list of (velocity, peak_voltage, group_name, avg_velocity) tuples
+# Example: DATA = [(velocity, peak_voltage, group_name, avg_velocity), ...]
 DATA = [
-    (0.105, 0.131),
-    (0.232, 0.392),
-    (0.357, 0.550),
+    (0.105, 0.131, "Group 1", 0.105),
+    (0.232, 0.392, "Group 2", 0.232),
+    (0.357, 0.550, "Group 3", 0.357),
 ]
 
 # ============================================================================
@@ -20,8 +23,8 @@ DATA = [
 # ============================================================================
 
 # Axis labels
-X_AXIS_LABEL = "Velocity (m/s)"
-Y_AXIS_LABEL = "abs(Voltage) (V)"
+X_AXIS_LABEL = "Average Velocity (m/s)"
+Y_AXIS_LABEL = "Absolute Peak Voltage (V)"
 
 # Axis ranges (set to None for auto-scaling)
 X_MIN = None
@@ -30,13 +33,12 @@ Y_MIN = None
 Y_MAX = None
 
 # Legend and markers
-LEGEND_LABEL = "Data Series"
 SHOW_MARKERS = True
-MARKER_SIZE = 4
+MARKER_SIZE = 8
 
 # Title and output
 TITLE = None  # Set to None to omit title, or use a string like "My Figure"
-OUTPUT_FILENAME = "line_graph.png"
+OUTPUT_FILENAME = "figures/line_graph.png"
 
 # ============================================================================
 # PUBLICATION-QUALITY MATPLOTLIB CONFIGURATION (from rover_test_simple_grapher)
@@ -50,7 +52,7 @@ PUBLICATION_RCPARAMS = {
     'ytick.labelsize': 6,
     'font.family': 'sans-serif',
     'lines.linewidth': 0.75,
-    'lines.markersize': MARKER_SIZE,
+    'lines.markersize': 4,
     'axes.linewidth': 0.5,
     'xtick.major.width': 0.5,
     'ytick.major.width': 0.5,
@@ -60,14 +62,14 @@ PUBLICATION_RCPARAMS = {
 }
 
 # Professional color palette (colorblind-friendly)
-COLOR_PRIMARY = '#0173B2'  # Blue for primary data
+TRIAL_COLORS = ['#0173B2', '#DE8F05', '#029E73', '#D55E00']  # Blue, Orange, Green, Red
 
 
 def create_line_figure(x_data, y_data, x_label, y_label, x_min=None, x_max=None,
-                       y_min=None, y_max=None, legend_label=None, show_markers=True,
-                       title=None, output_file="line_graph.png"):
+                       y_min=None, y_max=None, group_names=None, avg_velocities=None,
+                       show_markers=True, title=None, output_file="line_graph.png"):
     """
-    Create a publication-quality line graph.
+    Create a publication-quality line graph with multiple colored data points.
 
     Parameters:
     -----------
@@ -83,8 +85,10 @@ def create_line_figure(x_data, y_data, x_label, y_label, x_min=None, x_max=None,
         X-axis range (None for auto-scale)
     y_min, y_max : float or None
         Y-axis range (None for auto-scale)
-    legend_label : str or None
-        Label for the data series (for legend)
+    group_names : list or None
+        List of group names for legend (one per data point)
+    avg_velocities : list or None
+        List of average velocities for each data point
     show_markers : bool
         Whether to show markers at data points
     title : str or None
@@ -95,20 +99,28 @@ def create_line_figure(x_data, y_data, x_label, y_label, x_min=None, x_max=None,
     # Apply publication settings
     rcParams.update(PUBLICATION_RCPARAMS)
 
-    # Create figure with journal-compliant dimensions (single column)
+    # Create figure with journal-standard dimensions (matching rover_test_simple_grapher)
     fig, ax = plt.subplots(figsize=(3.25, 2.5))
 
     # Convert data to numpy arrays
     x_data = np.array(x_data)
     y_data = np.array(y_data)
 
-    # Plot data
-    if show_markers:
-        ax.plot(x_data, y_data, color=COLOR_PRIMARY, linewidth=0.75,
-                marker='o', markersize=4, label=legend_label, zorder=2)
-    else:
-        ax.plot(x_data, y_data, color=COLOR_PRIMARY, linewidth=0.75,
-                label=legend_label, zorder=2)
+    # Plot line connecting points
+    ax.plot(x_data, y_data, color='#808080', linewidth=0.75, zorder=1, alpha=0.5)
+
+    # Plot individual data points with colors
+    for i, (x, y) in enumerate(zip(x_data, y_data)):
+        color = TRIAL_COLORS[i % len(TRIAL_COLORS)]
+        if group_names and i < len(group_names):
+            if avg_velocities and i < len(avg_velocities):
+                label = f"{group_names[i]}: {avg_velocities[i]:.3f} m/s"
+            else:
+                label = group_names[i]
+        else:
+            label = f'Point {i+1}'
+        ax.plot(x, y, marker='o', markersize=6, color=color,
+               label=label, zorder=3)
 
     # Set axis labels
     ax.set_xlabel(x_label, fontsize=8)
@@ -128,10 +140,9 @@ def create_line_figure(x_data, y_data, x_label, y_label, x_min=None, x_max=None,
     ax.spines['top'].set_visible(False)
     ax.spines['right'].set_visible(False)
 
-    # Add legend if label provided
-    if legend_label is not None:
-        ax.legend(loc='best', frameon=True, fancybox=False,
-                  edgecolor='gray', framealpha=0.9, fontsize=7)
+    # Add legend with all data points
+    ax.legend(loc='lower right', frameon=True, fancybox=False,
+              edgecolor='gray', framealpha=0.9, fontsize=7)
 
     # Add title if provided
     if title is not None:
@@ -158,13 +169,19 @@ def main():
         print("Error: No data provided. Edit the DATA variable at the top of the script.")
         return
 
-    # Extract x and y from data tuples
-    x_values = [point[0] for point in DATA]
+    # Extract x, y, group names, and average velocities from data tuples
+    x_values = [point[3] for point in DATA]
     y_values = [point[1] for point in DATA]
+    group_names = [point[2] if len(point) > 2 else f"Point {i+1}" for i, point in enumerate(DATA)]
+    avg_velocities = [point[3] if len(point) > 3 else point[0] for point in DATA]
 
     print(f"Plotting {len(DATA)} data points...")
     print(f"X range: {min(x_values):.3f} to {max(x_values):.3f}")
     print(f"Y range: {min(y_values):.3f} to {max(y_values):.3f}")
+
+    # Print point details
+    for i, (x, y, name, avg_vel) in enumerate(zip(x_values, y_values, group_names, avg_velocities)):
+        print(f"  Point {i+1}: {name} - Avg Velocity: {avg_vel:.3f} m/s, Peak Voltage: {y:.3f} V")
 
     # Create the figure
     create_line_figure(
@@ -176,7 +193,8 @@ def main():
         x_max=X_MAX,
         y_min=Y_MIN,
         y_max=Y_MAX,
-        legend_label=LEGEND_LABEL,
+        group_names=group_names,
+        avg_velocities=avg_velocities,
         show_markers=SHOW_MARKERS,
         title=TITLE,
         output_file=OUTPUT_FILENAME

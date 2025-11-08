@@ -7,7 +7,7 @@ from matplotlib import rcParams
 from datetime import datetime
 
 # Configuration
-THRESHOLD = 0.025  # Voltage threshold for collision detection (25 mV)
+THRESHOLD = 0.05  # Voltage threshold for collision detection (50 mV)
 DISTANCE = 0.8  # Distance traveled in meters (adjust based on your setup)
 
 # Publication-quality matplotlib configuration
@@ -425,17 +425,158 @@ def create_multi_detail_figure(all_trials_data, output_file, window_ms=500):
     plt.close(fig)
 
 
+def create_subfigure_detail_figure(all_trials_data, output_file, num_subfigures, window_ms=500):
+    """Create publication-quality detail figure with multiple subfigures.
+    Each subfigure shows 3 trials overlaid, with all collisions aligned.
+    All subfigures share a single legend."""
+    rcParams.update(PUBLICATION_RCPARAMS)
+
+    # Create figure with subplots stacked vertically
+    # Width: 4.5in (AIAA single-column standard)
+    # Total figure 1:1 square aspect ratio
+    fig_width = 4.5
+    fig_height = 4.5  # 1:1 aspect ratio for entire figure
+    subplot_height = fig_height / num_subfigures
+    fig, axes_raw = plt.subplots(num_subfigures, 1, figsize=(fig_width, fig_height))
+
+    # Handle single subplot case (axes is not a list)
+    if num_subfigures == 1:
+        axes = [axes_raw]
+    else:
+        axes = list(axes_raw)  # type: ignore
+
+    # Process each subfigure (group of 3 trials)
+    for subfig_idx in range(num_subfigures):
+        ax = axes[subfig_idx]
+        start_trial_idx = subfig_idx * 3
+        end_trial_idx = start_trial_idx + 3
+
+        # Get trials for this subfigure
+        subfigure_trials = all_trials_data[start_trial_idx:end_trial_idx]
+
+        # Calculate velocities for this subfigure
+        velocities = []
+        for trial_data in subfigure_trials:
+            collision_time = trial_data['collision_time']
+            if collision_time is not None and collision_time > 0:
+                # Velocity = distance / time (0.8 m / collision_time_s)
+                velocity = DISTANCE / collision_time
+                velocities.append(velocity)
+
+        # Calculate average velocity for this subfigure
+        avg_velocity = np.mean(velocities) if velocities else 0
+
+        # Find the first trial's collision time to use as x-axis reference
+        first_collision_time_s = None
+        for trial_data in subfigure_trials:
+            if trial_data['collision_idx'] is not None:
+                first_collision_time_s = trial_data['collision_time']
+                break
+
+        # Calculate global minimum time for x-axis alignment
+        min_time_overall = float('inf')
+        for td in subfigure_trials:
+            if td['collision_idx'] is None:
+                continue
+            window_s = window_ms / 1000.0
+            start = td['collision_time'] - window_s
+            end = td['collision_time'] + window_s
+            m = (td['relative_time'] >= start) & (td['relative_time'] <= end)
+            if np.any(m):
+                ct = td['collision_time']
+                if first_collision_time_s is not None:
+                    offset = first_collision_time_s - ct
+                    t = td['relative_time'][m] + offset
+                else:
+                    t = td['relative_time'][m]
+                min_time_overall = min(min_time_overall, np.min(t))
+
+        # Mark detection threshold lines
+        ax.axhline(y=THRESHOLD, color='#CC0000', linestyle='--', linewidth=0.5, alpha=0.7, zorder=3, label='Detection threshold')
+        ax.axhline(y=-THRESHOLD, color='#CC0000', linestyle='--', linewidth=0.5, alpha=0.7, zorder=3)
+
+        # Plot each trial in this subfigure with relabeled names
+        for trial_idx, trial_data in enumerate(subfigure_trials):
+            relative_time = trial_data['relative_time']
+            voltages = trial_data['voltages']
+            collision_idx = trial_data['collision_idx']
+            collision_time = trial_data['collision_time']
+            color = trial_data['color']
+
+            if collision_idx is None:
+                continue
+
+            # Extract window around this trial's collision
+            window_s = window_ms / 1000.0
+            start_time = collision_time - window_s
+            end_time = collision_time + window_s
+
+            mask = (relative_time >= start_time) & (relative_time <= end_time)
+
+            if not np.any(mask):
+                continue
+
+            # Extract windowed data
+            windowed_time = relative_time[mask]
+            windowed_voltage = voltages[mask]
+
+            # Align time data: shift so this trial's collision aligns with the first trial's collision time
+            if first_collision_time_s is not None:
+                time_offset = first_collision_time_s - collision_time
+                windowed_time_aligned = windowed_time + time_offset
+            else:
+                windowed_time_aligned = windowed_time
+
+            # Convert to milliseconds and shift to start at 0
+            windowed_time_aligned_ms = windowed_time_aligned * 1000
+            windowed_time_aligned_ms = windowed_time_aligned_ms - np.min(windowed_time_aligned_ms)
+
+            # Plot this trial's data with local trial number (1, 2, or 3)
+            ax.plot(windowed_time_aligned_ms, windowed_voltage, color=color, linewidth=0.75,
+                    label=f'Trial {trial_idx + 1}', alpha=0.8)
+
+        # Styling for this subplot
+        ax.set_title(f'Avg Velocity: {avg_velocity:.3f} m/s', fontsize=8, pad=10)
+        ax.set_ylabel('Voltage (V)', fontsize=8)
+
+        # Only set x-axis label for the bottom subplot
+        if subfig_idx == num_subfigures - 1:
+            ax.set_xlabel('Time (ms)', fontsize=8)
+
+        # Grid: Y-axis only, light, minimal
+        ax.grid(True, axis='y', color='gray', linestyle='-', linewidth=0.3, alpha=0.3)
+        ax.set_axisbelow(True)
+
+        # Remove top and right spines (Tufte principle)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+
+        # Add legend for this subplot
+        ax.legend(loc='lower left', frameon=True, fancybox=False,
+                  edgecolor='gray', framealpha=0.9, fontsize=6)
+
+    # Adjust layout
+    fig.tight_layout()
+
+    # Save at publication quality
+    fig.savefig(output_file, dpi=600, bbox_inches='tight', format='png')
+    print(f"Sub-figure collision detail ({num_subfigures} subplots, ±{window_ms}ms) saved to: {output_file}")
+    plt.close(fig)
+
+
 def main():
     if len(sys.argv) < 2:
         print("Usage: python rover_test_simple_grapher.py <csv_file> [csv_file2] [csv_file3] ... [--window-size MS]")
         print("  Single file:   python rover_test_simple_grapher.py data/rover_run_data_0.csv")
         print("  Multiple files: python rover_test_simple_grapher.py data/rover_run_data_0.csv data/rover_run_data_1.csv data/rover_run_data_2.csv")
         print("  Custom window:  python rover_test_simple_grapher.py data/rover_run_data_0.csv --window-size 500")
+        print("  Sub-figures:    python rover_test_simple_grapher.py --sub-figure 3 data/rover_run_data_0.csv ... (9 files total)")
         sys.exit(1)
 
-    # Parse arguments: extract --window-size if present
+    # Parse arguments: extract --window-size and --sub-figure if present
     args = sys.argv[1:]
     window_ms = 500  # Default window size in milliseconds
+    num_subfigures = None  # None means no subfigures (use default behavior)
 
     csv_files = []
     i = 0
@@ -452,6 +593,17 @@ def main():
             else:
                 print(f"Error: --window-size requires a value")
                 sys.exit(1)
+        elif arg == '--sub-figure':
+            if i + 1 < len(args):
+                try:
+                    num_subfigures = int(args[i + 1])
+                    i += 2  # Skip both --sub-figure and its value
+                except ValueError:
+                    print(f"Error: --sub-figure requires an integer value (number of subfigures)")
+                    sys.exit(1)
+            else:
+                print(f"Error: --sub-figure requires a value")
+                sys.exit(1)
         elif not arg.startswith('--'):
             csv_files.append(arg)
             i += 1
@@ -462,6 +614,13 @@ def main():
     if not csv_files:
         print("Error: No CSV files specified")
         sys.exit(1)
+
+    # Validate subfigure mode
+    if num_subfigures is not None:
+        expected_files = num_subfigures * 3
+        if len(csv_files) != expected_files:
+            print(f"Error: --sub-figure {num_subfigures} requires exactly {expected_files} CSV files, but {len(csv_files)} were provided")
+            sys.exit(1)
 
     # Create figures directory if it doesn't exist
     figures_dir = 'figures'
@@ -608,6 +767,12 @@ def main():
             print(f"Generating multi-trial publication-quality figures...")
             create_multi_timeline_figure(all_trials_data, timeline_output, window_ms=window_ms)
             create_multi_detail_figure(all_trials_data, detail_output, window_ms=window_ms)
+
+            # Create subfigure detail view if requested
+            if num_subfigures is not None:
+                subfigure_output = os.path.join(figures_dir, f"merged_{timestamp}_subfigures_{num_subfigures}.png")
+                print(f"Generating subfigure detail view ({num_subfigures} subplots)...")
+                create_subfigure_detail_figure(all_trials_data, subfigure_output, num_subfigures, window_ms=window_ms)
 
             print(f"\nMulti-trial figures saved successfully!")
 
